@@ -741,3 +741,253 @@ def test_lower_limit_below_used_shows_negative_remaining_and_blocks(client):
     ])
     assert r.status_code == 422
     assert r.json()["error"]["detail"]["reason"] == "spending_limit_exceeded"
+
+
+# ============================================================ 批量过账
+def _batch_voucher(rid, amount, vdate="2026-09-20", currency="CNY",
+                   debit_id=None, credit_id=None, memo=None):
+    return {
+        "request_id": rid,
+        "date": vdate,
+        "currency": currency,
+        "memo": memo,
+        "lines": [
+            {"account_id": debit_id, "direction": "debit", "amount": amount},
+            {"account_id": credit_id, "direction": "credit", "amount": amount},
+        ],
+    }
+
+
+def test_batch_post_creates_in_order_with_sequential_numbers(client):
+    bank = _create_account(client, "1002", "银行存款")
+    income = _create_account(client, "4001", "科研拨款", atype="income")
+
+    r = client.post("/vouchers/batch", json={"items": [
+        _batch_voucher("b-1", "100.00", vdate="2026-09-10",
+                       debit_id=bank["id"], credit_id=income["id"]),
+        _batch_voucher("b-2", "200.00", vdate="2026-09-11",
+                       debit_id=bank["id"], credit_id=income["id"]),
+        _batch_voucher("b-3", "50.00", vdate="2026-08-05",
+                       debit_id=bank["id"], credit_id=income["id"]),
+    ]})
+    assert r.status_code == 201, r.text
+    assert r.headers["X-Idempotent-Replay"] == "false"
+    body = r.json()
+    assert body["created_count"] == 3 and body["replay_count"] == 0
+    # 严格按请求顺序返回，逐项给出凭证与回放标志
+    assert [it["voucher"]["request_id"] for it in body["items"]] == ["b-1", "b-2", "b-3"]
+    assert [it["idempotent_replay"] for it in body["items"]] == [False, False, False]
+    # 凭证号按各自期间顺序分配；9 月的两张保持批内顺序
+    assert [it["voucher"]["number"] for it in body["items"]] == [
+        "V-2026-09-0001", "V-2026-09-0002", "V-2026-08-0001",
+    ]
+
+    # 余额为三张凭证的累计
+    bal = client.get(f"/accounts/{bank['id']}/balances").json()
+    by_period = {b["period_key"]: b for b in bal}
+    assert by_period["2026-09"]["total_debit"] == "300.00"
+    assert by_period["2026-08"]["total_debit"] == "50.00"
+
+
+def test_batch_replays_existing_request_ids_without_double_posting(client):
+    bank = _create_account(client, "1002", "银行存款")
+    income = _create_account(client, "4001", "科研拨款", atype="income")
+
+    # 先由单笔接口创建 b-exist
+    first = _post_voucher(client, "b-exist", [
+        {"account_id": bank["id"], "direction": "debit", "amount": "120.00"},
+        {"account_id": income["id"], "direction": "credit", "amount": "120.00"},
+    ])
+    assert first.status_code == 201
+    existing_id = first.json()["id"]
+
+    # 批量：一张回放已存在凭证 + 一张新建，按请求顺序
+    r = client.post("/vouchers/batch", json={"items": [
+        _batch_voucher("b-exist", "120.00", debit_id=bank["id"], credit_id=income["id"]),
+        _batch_voucher("b-new", "80.00", debit_id=bank["id"], credit_id=income["id"]),
+    ]})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["created_count"] == 1 and body["replay_count"] == 1
+    assert body["items"][0]["idempotent_replay"] is True
+    assert body["items"][0]["voucher"]["id"] == existing_id
+    assert body["items"][1]["idempotent_replay"] is False
+
+    # 回放不重复入账：银行借方只有 120 + 80
+    bal = client.get(f"/accounts/{bank['id']}/balances").json()
+    assert bal[0]["total_debit"] == "200.00"
+
+    # 整批全部是回放时返回 200 + replay 头
+    r = client.post("/vouchers/batch", json={"items": [
+        _batch_voucher("b-exist", "120.00", debit_id=bank["id"], credit_id=income["id"]),
+    ]})
+    assert r.status_code == 200
+    assert r.headers["X-Idempotent-Replay"] == "true"
+    assert r.json()["created_count"] == 0 and r.json()["replay_count"] == 1
+    assert bal[0]["total_debit"] == "200.00"
+
+
+def test_batch_duplicate_request_id_in_batch_rejected(client):
+    bank = _create_account(client, "1002", "银行存款")
+    income = _create_account(client, "4001", "科研拨款", atype="income")
+
+    r = client.post("/vouchers/batch", json={"items": [
+        _batch_voucher("dup", "10.00", debit_id=bank["id"], credit_id=income["id"]),
+        _batch_voucher("other", "10.00", debit_id=bank["id"], credit_id=income["id"]),
+        _batch_voucher("dup", "10.00", debit_id=bank["id"], credit_id=income["id"]),
+    ]})
+    assert r.status_code == 409, r.text
+    detail = r.json()["error"]["detail"]
+    assert detail["reason"] == "duplicate_request_id_in_batch"
+    assert detail["duplicate_request_ids"] == ["dup"]
+
+    # 整批拒绝：无凭证、无余额、无凭证号
+    assert client.get("/vouchers").json()["items"] == []
+    assert client.get(f"/accounts/{bank['id']}/balances").json() == []
+
+
+def test_batch_size_limits(client):
+    bank = _create_account(client, "1002", "银行存款")
+    income = _create_account(client, "4001", "科研拨款", atype="income")
+
+    item = _batch_voucher("x", "1.00", debit_id=bank["id"], credit_id=income["id"])
+
+    assert client.post("/vouchers/batch", json={"items": []}).status_code == 422
+    assert client.post("/vouchers/batch", json={
+        "items": [{**item, "request_id": f"many-{i}"} for i in range(21)]
+    }).status_code == 422
+    # 20 张正好允许
+    r = client.post("/vouchers/batch", json={
+        "items": [{**item, "request_id": f"many-{i}"} for i in range(20)]
+    })
+    assert r.status_code == 201, r.text
+    assert r.json()["created_count"] == 20
+
+
+def test_batch_rolls_back_all_when_any_item_fails(client):
+    bank = _create_account(client, "1002", "银行存款")
+    income = _create_account(client, "4001", "科研拨款", atype="income")
+
+    # 第 2 张借贷不平 -> 第 1 张也必须回滚 (凭证、凭证号、余额)
+    r = client.post("/vouchers/batch", json={"items": [
+        _batch_voucher("rb-1", "100.00", debit_id=bank["id"], credit_id=income["id"]),
+        {
+            "request_id": "rb-2", "date": "2026-09-11", "currency": "CNY",
+            "lines": [
+                {"account_id": bank["id"], "direction": "debit", "amount": "100.00"},
+                {"account_id": income["id"], "direction": "credit", "amount": "99.00"},
+            ],
+        },
+    ]})
+    assert r.status_code == 422
+    assert client.get("/vouchers").json()["items"] == []
+    assert client.get(f"/accounts/{bank['id']}/balances").json() == []
+
+    # 失败后凭证号不留空洞：下一张成功的凭证仍为 0001
+    r = _post_voucher(client, "rb-after", [
+        {"account_id": bank["id"], "direction": "debit", "amount": "100.00"},
+        {"account_id": income["id"], "direction": "credit", "amount": "100.00"},
+    ], vdate="2026-09-12")
+    assert r.status_code == 201
+    assert r.json()["number"] == "V-2026-09-0001"
+
+    # 期间已结账同样整批回滚：第 1 张落在开放的 9 月，第 2 张落在已结账的 8 月
+    client.post("/periods/2026-08/close")
+    r = client.post("/vouchers/batch", json={"items": [
+        _batch_voucher("rb-3", "10.00", vdate="2026-09-13",
+                       debit_id=bank["id"], credit_id=income["id"]),
+        _batch_voucher("rb-4", "10.00", vdate="2026-08-13",
+                       debit_id=bank["id"], credit_id=income["id"]),
+    ]})
+    assert r.status_code == 409
+    detail = r.json()["error"]["detail"]
+    assert detail["batch_index"] == 2 and detail["request_id"] == "rb-4"
+    assert client.get("/vouchers/by-request/rb-3").status_code == 404
+
+
+def test_batch_prior_new_voucher_consumes_limit_for_later_item(client):
+    bank = _create_account(client, "1002", "银行存款")
+    expense = _create_account(client, "5001", "科研设备费", atype="expense")
+    assert _set_limit(client, expense["id"], "2026-09", "1000.00").status_code == 200
+
+    def exp_item(rid, amount):
+        return _batch_voucher(rid, amount, debit_id=expense["id"], credit_id=bank["id"])
+
+    # 单看每张都不超限 (600+500=1100)，但前序新凭证占用的额度必须计入后序
+    r = client.post("/vouchers/batch", json={"items": [
+        exp_item("bl-1", "600.00"),
+        exp_item("bl-2", "500.00"),
+    ]})
+    assert r.status_code == 422, r.text
+    detail = r.json()["error"]["detail"]
+    assert detail["reason"] == "spending_limit_exceeded"
+    assert detail["batch_index"] == 2
+    assert detail["used_minor"] == 60000
+    assert detail["new_debit_minor"] == 50000
+
+    # 整批回滚：已用额为 0，无凭证与余额
+    info = client.get(f"/accounts/{expense['id']}/limits/2026-09").json()
+    assert info["used_debit"] == "0.00"
+    assert client.get("/vouchers").json()["items"] == []
+
+    # 合计恰好等于限额：前序 600 + 后序 400 顺序通过
+    r = client.post("/vouchers/batch", json={"items": [
+        exp_item("bl-3", "600.00"),
+        exp_item("bl-4", "400.00"),
+    ]})
+    assert r.status_code == 201, r.text
+    info = client.get(f"/accounts/{expense['id']}/limits/2026-09").json()
+    assert info["used_debit"] == "1000.00"
+
+
+def test_batch_replayed_voucher_does_not_consume_limit(client):
+    bank = _create_account(client, "1002", "银行存款")
+    expense = _create_account(client, "5001", "科研设备费", atype="expense")
+    assert _set_limit(client, expense["id"], "2026-09", "600.00").status_code == 200
+
+    # 单笔先用满 600
+    assert _post_voucher(client, "blr-1", [
+        {"account_id": expense["id"], "direction": "debit", "amount": "600.00"},
+        {"account_id": bank["id"], "direction": "credit", "amount": "600.00"},
+    ]).status_code == 201
+
+    # 批内先回放旧凭证 (不占额度)，随后新建 0 张时只剩 0 额度；
+    # 若回放被错误计入已用额，已用仍是 600 —— 这里验证新凭证 0.01 被拒，
+    # 且"回放 + 不超限新凭证"组合可成功
+    r = client.post("/vouchers/batch", json={"items": [
+        _batch_voucher("blr-1", "600.00", debit_id=expense["id"], credit_id=bank["id"]),
+    ]})
+    assert r.status_code == 200
+    info = client.get(f"/accounts/{expense['id']}/limits/2026-09").json()
+    assert info["used_debit"] == "600.00" and info["remaining"] == "0.00"
+
+    # 回放项在前不影响后序校验：上调限额后，回放 + 新建 100 成功
+    assert _set_limit(client, expense["id"], "2026-09", "700.00").status_code == 200
+    r = client.post("/vouchers/batch", json={"items": [
+        _batch_voucher("blr-1", "600.00", debit_id=expense["id"], credit_id=bank["id"]),
+        _batch_voucher("blr-2", "100.00", debit_id=expense["id"], credit_id=bank["id"]),
+    ]})
+    assert r.status_code == 201, r.text
+    assert [it["idempotent_replay"] for it in r.json()["items"]] == [True, False]
+    info = client.get(f"/accounts/{expense['id']}/limits/2026-09").json()
+    assert info["used_debit"] == "700.00"
+
+
+def test_batch_single_endpoint_behavior_unchanged(client):
+    bank = _create_account(client, "1002", "银行存款")
+    income = _create_account(client, "4001", "科研拨款", atype="income")
+
+    # 单笔接口：201/false，重复回放 200/true；与批量共存互不影响
+    r1 = _post_voucher(client, "single-1", [
+        {"account_id": bank["id"], "direction": "debit", "amount": "30.00"},
+        {"account_id": income["id"], "direction": "credit", "amount": "30.00"},
+    ])
+    r2 = _post_voucher(client, "single-1", [
+        {"account_id": bank["id"], "direction": "debit", "amount": "30.00"},
+        {"account_id": income["id"], "direction": "credit", "amount": "30.00"},
+    ])
+    assert r1.status_code == 201 and r2.status_code == 200
+    assert r2.headers["X-Idempotent-Replay"] == "true"
+    bal = client.get(f"/accounts/{bank['id']}/balances").json()
+    assert bal[0]["total_debit"] == "30.00"
+

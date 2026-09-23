@@ -14,6 +14,7 @@
 - **不可变凭证**：过账后凭证头/分录不可 `UPDATE`/`DELETE`（服务层 + SQLite 触发器双重保证），并分配期间内顺序凭证号 `V-YYYY-MM-NNNN`。
 - **只能反向冲销**：撤销通过提交「反向凭证」完成——借贷方向逐行对调、金额不变，双向保留 `reverses_id` / `reversed_by_id` 关联，可跨期间冲销（原期间已结账也可冲入新的开放期间），禁止重复冲销。
 - **request_id 幂等**：客户端为每次提交提供唯一键，网络重试/重复提交返回同一凭证（`200` + `X-Idempotent-Replay: true`），余额不重复累计、**支出限额不重复占用**。
+- **批量过账**：`POST /vouchers/batch` 一次按请求顺序提交 1～20 张普通凭证，所有新凭证、凭证号与余额更新共用**一个事务**；响应逐项返回凭证及 `idempotent_replay` 回放标志。批内重复 `request_id` 整批拒绝（`409`）；已存在的 `request_id` 按单笔同样的幂等语义回放；复用单笔的期间、借贷、币种与费用月度限额校验，**同批前序新凭证占用的额度计入后序校验**；任一项失败整批回滚，单笔接口行为不变。
 - **费用科目月度支出限额**：可为费用科目按 `YYYY-MM` 设置/调整支出上限；过账时在同一写事务内把本次借方费用与该科目本月已过账（未冲销）借方费用合计比较，超限整体拒绝，不写入凭证、凭证号或余额；被冲销凭证自动释放原期间已用额度。
 - **余额物化**：按（科目 × 期间）实时维护借贷累计额，过账/冲销在同一事务内 UPSERT。
 - **查询**：科目余额（可按期间）、科目分类账（逐笔累计余额、游标分页）、凭证列表（按科目/期间过滤）、凭证链（原始凭证 ↔ 反向凭证）。
@@ -72,6 +73,7 @@ python3 -m pytest -q
 | GET | `/accounts/{id}/balances?period=YYYY-MM` | 科目各期间余额 |
 | GET | `/accounts/{id}/ledger?period_from=&period_to=&cursor=&limit=` | 科目分类账（逐笔累计） |
 | POST | `/vouchers` | 提交凭证（`request_id` 幂等） |
+| POST | `/vouchers/batch` | 批量提交 1-20 张普通凭证（单事务、顺序过账、逐项幂等回放） |
 | GET | `/vouchers?account_id=&period=&cursor=` | 凭证列表/过滤 |
 | GET | `/vouchers/by-request/{request_id}` | 按幂等键反查 |
 | GET | `/vouchers/{id}` | 凭证详情 |
@@ -120,7 +122,59 @@ curl -XPOST localhost:8000/vouchers -H 'Content-Type: application/json' -d '{
 
 借贷不平、科目币种与凭证币种不一致、期间已结账等情况会得到 `422`/`409`，且不写入任何数据。用同一 `request_id` 重放得到同一凭证、余额不翻倍。
 
-### 3. 结账与冲销
+### 3. 批量提交凭证（1～20 张，单事务）
+
+`POST /vouchers/batch` 按 `items` 的数组顺序逐张过账，整批评语义与单笔一致，适合一次性导入多张凭证（服务通过 `docker compose up --build` 启动后，访问地址为 http://localhost:8000）：
+
+```bash
+curl -XPOST localhost:8000/vouchers/batch -H 'Content-Type: application/json' -d '{
+  "items": [
+    {
+      "request_id": "grant-2026-0002",
+      "date": "2026-09-21",
+      "currency": "CNY",
+      "memo": "设备费报销",
+      "lines": [
+        {"account_id": 5, "direction": "debit",  "amount": "3000.00"},
+        {"account_id": 1, "direction": "credit", "amount": "3000.00"}
+      ]
+    },
+    {
+      "request_id": "grant-2026-0003",
+      "date": "2026-09-21",
+      "currency": "CNY",
+      "memo": "材料费报销",
+      "lines": [
+        {"account_id": 6, "direction": "debit",  "amount": "800.00"},
+        {"account_id": 1, "direction": "credit", "amount": "800.00"}
+      ]
+    }
+  ]
+}'
+```
+
+响应严格按请求顺序逐项给出凭证本体（与 `POST /vouchers` 相同的结构）和该项是否为幂等回放：
+
+```json
+{
+  "items": [
+    {"idempotent_replay": false, "voucher": {"id": 2, "number": "V-2026-09-0002", "...": "..."}},
+    {"idempotent_replay": false, "voucher": {"id": 3, "number": "V-2026-09-0003", "...": "..."}}
+  ],
+  "created_count": 2,
+  "replay_count": 0
+}
+```
+
+批量语义：
+
+- **批内顺序、单事务**：1～20 张（`items` 长度限制，越界 `422`）按数组顺序过账，所有新凭证、凭证号（同期间连续分配）与余额 UPSERT 在一个 `BEGIN IMMEDIATE` 事务内提交；任一
+  项失败（借贷不平、币种不一致、期间已结账、超月度限额等）整批回滚，失败位置在错误体 `detail.batch_index`（从 1 开始）与 `detail.request_id` 中给出；
+- **批内重复 request_id 拒绝**：同一 `request_id` 在 `items` 中出现多次时整批 `409`（`reason=duplicate_request_id_in_batch`），不写入任何数据；
+- **已存在凭证幂等回放**：`request_id` 已在库中时按单笔过账同样的语义原样回放（`idempotent_replay: true`，HTTP `200`），不重复入账、不重复占用支出限额；批内既有新建又有回放时整批返回 `201`，全部为回放时返回 `200`（响应头 `X-Idempotent-Replay: true`）；
+- **限额顺序累计**：复用单笔的期间、借贷、币种与费用月度限额校验；同批前序新凭证已 flush 的借方费用会被后序项的已用额聚合计入，因此前序占用必然影响后序校验（例如限额 1000，批内连续两张 600/500 的费用凭证会在第 2 张被拒并整批回滚）。
+
+### 4. 结账与冲销
 
 ```bash
 # 冻结 2026-09，之后不能再向该期间入账（409）
@@ -134,7 +188,7 @@ curl -XPOST localhost:8000/vouchers/1/reverse -H 'Content-Type: application/json
 }'
 ```
 
-### 4. 查询余额与凭证链
+### 5. 查询余额与凭证链
 
 ```bash
 curl localhost:8000/accounts/1/balances
@@ -142,7 +196,7 @@ curl localhost:8000/accounts/1/ledger
 curl localhost:8000/vouchers/1/chain
 ```
 
-### 5. 试算平衡表（只读）
+### 6. 试算平衡表（只读）
 
 汇总截止期间（含本期及此前各期间）的累计发生额与期末余额，按币种分组：
 
@@ -195,7 +249,7 @@ curl 'localhost:8000/reports/trial-balance?period=2026-09'
 - 币种级 `total_debit` / `total_credit` 是该币种全部列示科目的**期末余额合计**，`balanced` 表示二者是否相等；复式记账下各币种应恒为 `true`，否则意味着账套存在脏数据；
 - 该接口只读：不提交事务、不自动创建期间（对比 `GET /periods/{key}` 会自动开账）、不触碰余额与凭证。
 
-### 6. 费用科目月度支出限额
+### 7. 费用科目月度支出限额
 
 为费用科目（`type=expense`）按月份设置支出上限，限额金额沿用十进制字符串（整数分存储），只有费用科目可以设置，重复 `PUT` 即为调整（覆盖）：
 
@@ -266,11 +320,13 @@ curl -XPOST localhost:8000/vouchers -H 'Content-Type: application/json' -d '{
 
 ### 事务与并发
 
-所有写入（校验 → 编号 → 凭证/分录 → 余额 UPSERT → 冲销回填）在单个事务内完成。连接配置：
+所有写入（单笔校验 → 编号 → 凭证/分录 → 余额 UPSERT → 冲销回填）在单个事务内完成。连接配置：
 
 - pysqlite autocommit 模式由 SQLAlchemy 全权管理事务边界；
 - 每个事务以 `BEGIN IMMEDIATE` 开始，进入即取保留锁，写冲突在事务起点排队（`busy_timeout=10s`），而非在提交时抛锁错误；
 - WAL 模式允许读写并发。
+
+批量过账 (`POST /vouchers/batch`) 复用同一套逐项流程但**全批共用一个事务**：批内重复 `request_id` 在开启任何写入前先拒绝；逐项按请求顺序处理，每张新凭证写完凭证头/分录后立即 `flush`，使同批后序项的月度限额实时聚合（`voucher_lines` 的 `SUM`）能看到前序新凭证的借方费用占用；任一项抛错则 `rollback` 整批——新凭证、期间顺序凭证号（编号表 UPSERT 同样回滚，不留号段空洞）与余额全部撤销，已存在的回放凭证本就未被修改。
 
 ### 金额处理
 
@@ -306,7 +362,7 @@ API 边界使用字符串（正则限定非负、最多两位小数），服务�
 │   ├── seed.py              # 演示账套 (幂等)
 │   ├── routers/             # accounts (含支出限额) / periods / vouchers / reports
 │   └── services/            # master_data（科目/期间）、voucher（过账/冲销/查询）、spending_limits（限额设置/校验）、reports（只读报表）
-├── tests/test_api.py        # 25 组端到端测试
+├── tests/test_api.py        # 33 组端到端测试
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml

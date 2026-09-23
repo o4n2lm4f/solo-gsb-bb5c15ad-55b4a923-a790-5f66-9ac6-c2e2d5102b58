@@ -1,4 +1,4 @@
-"""凭证领域服务：过账、冲销、查询。
+"""凭证领域服务：过账、批量过账、冲销、查询。
 
 过账在单个 ``BEGIN IMMEDIATE`` 事务内完成：
 
@@ -11,6 +11,11 @@
 7. 写入不可变凭证与分录；
 8. UPSERT 每个 (科目, 期间) 的余额；
 9. commit。任一步失败整体回滚。
+
+批量过账 (``POST /vouchers/batch``) 复用同一套逐项流程：1-20 张凭证在
+**同一个事务**内按请求顺序处理，批内重复 request_id 整批拒绝；同批前序
+新凭证 flush 后对后序的限额聚合立即可见，因此会顺序占用月度限额；任一
+项失败回滚全部新凭证、凭证号与余额。
 """
 from __future__ import annotations
 
@@ -21,7 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from ..errors import conflict, not_found, unprocessable
+from ..errors import AppError, conflict, not_found, unprocessable
 from ..models import Account, Balance, Voucher, VoucherLine
 from ..money import amount_to_minor
 from ..schemas import LedgerEntry, LedgerOut, VoucherChainNode, VoucherChainOut
@@ -145,18 +150,24 @@ def get_by_request_id(db: Session, request_id: str) -> Optional[Voucher]:
 
 
 # ================================================================ 过账
-def post_voucher(db: Session, payload) -> tuple[Voucher, bool]:  # noqa: ANN001
-    """提交并过账凭证。返回 (凭证, 是否新建)；重复 request_id 幂等回放。"""
+def _post_one(db: Session, payload) -> tuple[Voucher, bool]:  # noqa: ANN001
+    """在**当前事务内**提交并过账一张凭证，不自行 commit。
+
+    返回 (凭证, 是否新建)；重复 request_id 原样回放，不写入任何数据。
+    新建路径末尾会 ``flush``：使本事务内后序项的限额聚合能立即看到
+    前序新凭证 (批量过账据此实现"前序占用计入后序校验")。
+    """
     existing = get_by_request_id(db, payload.request_id)
     if existing is not None:
         return existing, False
 
-    # 所有校验与写入在一个 IMMEDIATE 事务内
+    # 期间、借贷、币种与限额校验都在写入编号/凭证之前
     period_key, _period = assert_period_open(db, payload.voucher_date)
     result = _parse_lines(db, payload)
 
     # 月度支出限额：本次借方费用 + 本月已过账未冲销借方费用 > 限额则整体拒绝。
-    # 此时尚未分配凭证号/写入任何数据，超限直接抛错即回滚。
+    # 批量场景下已用额聚合 (voucher_lines 实时 SUM) 还包含同事务内已 flush
+    # 的前序新凭证，故前序占用必然计入本项校验。
     expense_debits: dict[int, int] = {}
     for item in result["parsed"]:
         if item["direction"] == "debit" and item["account"].type == "expense":
@@ -176,7 +187,7 @@ def post_voucher(db: Session, payload) -> tuple[Voucher, bool]:  # noqa: ANN001
         request_id=payload.request_id,
     )
     db.add(voucher)
-    db.flush()  # 取 voucher.id
+    db.flush()  # 取 voucher.id；同时让本项对后序项的限额聚合可见
 
     account_amounts: dict[int, list[int]] = {}
     for idx, item in enumerate(result["parsed"], start=1):
@@ -195,9 +206,64 @@ def post_voucher(db: Session, payload) -> tuple[Voucher, bool]:  # noqa: ANN001
             slot[1] += item["amount_minor"]
 
     _apply_balances(db, period_key, {k: (v[0], v[1]) for k, v in account_amounts.items()})
-    db.commit()
-    db.refresh(voucher)
+    db.flush()
     return voucher, True
+
+
+def post_voucher(db: Session, payload) -> tuple[Voucher, bool]:  # noqa: ANN001
+    """单笔提交并过账凭证：重复 request_id 幂等回放，失败整体回滚。"""
+    try:
+        voucher, created = _post_one(db, payload)
+    except Exception:
+        db.rollback()
+        raise
+    if created:
+        db.commit()
+        db.refresh(voucher)
+    return voucher, created
+
+
+def post_vouchers_batch(db: Session, payloads: list) -> list[tuple[Voucher, bool]]:  # noqa: ANN001
+    """批量过账：所有新凭证、凭证号与余额更新共用一次事务。
+
+    - 批内 request_id 重复 (含同一 request_id 在批内出现多次) 整批拒绝；
+    - 已存在的普通凭证按单笔过账的幂等语义原样回放，不占额度、不重复入账；
+    - 各项严格按请求顺序处理，同批前序新凭证占用的限额计入后序校验；
+    - 任一项失败回滚全部新凭证/凭证号/余额 (已存在的凭证本就未被修改)。
+    """
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for pos, item in enumerate(payloads, start=1):
+        if item.request_id in seen:
+            duplicates.append(item.request_id)
+        seen.add(item.request_id)
+    if duplicates:
+        raise conflict(
+            "批内 request_id 重复，整批拒绝",
+            reason="duplicate_request_id_in_batch",
+            duplicate_request_ids=list(dict.fromkeys(duplicates)),
+        )
+
+    results: list[tuple[Voucher, bool]] = []
+    try:
+        for pos, item in enumerate(payloads, start=1):
+            try:
+                results.append(_post_one(db, item))
+            except AppError as exc:
+                # 标明失败项位置，便于客户端定位；随后整批回滚
+                exc.detail.setdefault("batch_index", pos)
+                exc.detail.setdefault("request_id", item.request_id)
+                raise
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    # expire_on_commit=False 下属性仍可用；refresh 与单笔接口保持一致
+    for voucher, created in results:
+        if created:
+            db.refresh(voucher)
+    return results
 
 
 # ================================================================ 反向凭证

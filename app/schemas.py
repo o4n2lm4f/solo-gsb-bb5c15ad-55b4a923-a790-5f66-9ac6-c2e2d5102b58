@@ -81,6 +81,21 @@ class VoucherCreate(BaseModel):
         return v
 
 
+class VoucherBatchCreate(BaseModel):
+    """批量过账请求：严格按 ``items`` 数组顺序逐项处理，一批 1-20 张。
+
+    批内任一 ``request_id`` 重复整批拒绝；已存在的 ``request_id`` 按单笔
+    过账同样的幂等语义回放原凭证。
+    """
+
+    items: list[VoucherCreate] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="按请求顺序提交的普通凭证 (1-20 张)；批内 request_id 不可重复",
+    )
+
+
 class ReversalCreate(BaseModel):
     voucher_date: Optional[date] = Field(
         None, alias="date", description="反向凭证日期，默认取服务端当前日期"
@@ -210,6 +225,21 @@ class VoucherListOut(BaseModel):
     items: list[VoucherOut]
     limit: int
     next_cursor: Optional[int] = None
+
+
+class VoucherBatchItemOut(BaseModel):
+    """批量过账单项结果：原凭证视图 + 该项是否为幂等回放。"""
+
+    idempotent_replay: bool
+    voucher: VoucherOut
+
+
+class VoucherBatchOut(BaseModel):
+    """批量过账响应：按请求顺序逐项给出凭证与回放标志。"""
+
+    items: list[VoucherBatchItemOut]
+    created_count: int
+    replay_count: int
 
 
 # ---------------------------------------------------------------- 试算平衡表

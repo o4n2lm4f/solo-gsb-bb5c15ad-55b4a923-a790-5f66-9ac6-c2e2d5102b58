@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 from ..database import get_session
 from ..schemas import (
     ReversalCreate,
+    VoucherBatchCreate,
+    VoucherBatchOut,
     VoucherChainOut,
     VoucherCreate,
     VoucherListOut,
@@ -28,6 +30,31 @@ def post_voucher(
     response.status_code = 201 if created else 200
     response.headers["X-Idempotent-Replay"] = "false" if created else "true"
     return voucher_out(voucher)
+
+
+@router.post(
+    "/batch",
+    response_model=VoucherBatchOut,
+    summary="批量提交普通凭证 (1-20 张，单事务顺序过账，逐项幂等回放)",
+)
+def post_vouchers_batch(
+    payload: VoucherBatchCreate,
+    response: Response,
+    db: Session = Depends(get_session),
+) -> VoucherBatchOut:
+    results = voucher_service.post_vouchers_batch(db, payload.items)
+    any_created = any(created for _v, created in results)
+    response.status_code = 201 if any_created else 200
+    response.headers["X-Idempotent-Replay"] = "false" if any_created else "true"
+    items = [
+        {"idempotent_replay": not created, "voucher": voucher_out(voucher)}
+        for voucher, created in results
+    ]
+    return VoucherBatchOut(
+        items=items,
+        created_count=sum(1 for _v, created in results if created),
+        replay_count=sum(1 for _v, created in results if not created),
+    )
 
 
 @router.get("", response_model=VoucherListOut, summary="凭证列表 (可按科目/期间过滤，游标分页)")
