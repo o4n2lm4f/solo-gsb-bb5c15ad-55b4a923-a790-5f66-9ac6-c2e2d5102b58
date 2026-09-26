@@ -99,6 +99,12 @@ class ReversalCreate(BaseModel):
         return v
 
 
+class VoucherBatchCreate(BaseModel):
+    """批量提交：按数组顺序依次过账 1~20 张普通凭证，全部共享一个事务。"""
+
+    items: list[VoucherCreate] = Field(..., min_length=1, max_length=20)
+
+
 # ---------------------------------------------------------------- 支出限额
 class SpendingLimitCreate(BaseModel):
     amount: str = Field(
@@ -210,6 +216,20 @@ class VoucherListOut(BaseModel):
     items: list[VoucherOut]
     limit: int
     next_cursor: Optional[int] = None
+
+
+class VoucherBatchItemOut(BaseModel):
+    index: int            # 在请求数组中的位置 (从 0 开始)
+    request_id: str
+    replayed: bool        # True = 命中已有凭证幂等回放；False = 本次新建过账
+    voucher: VoucherOut
+
+
+class VoucherBatchOut(BaseModel):
+    count: int            # 本批条目总数
+    created: int          # 本次新建过账数量
+    replayed: int         # 幂等回放数量
+    items: list[VoucherBatchItemOut]
 
 
 # ---------------------------------------------------------------- 试算平衡表

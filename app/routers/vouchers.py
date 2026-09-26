@@ -1,4 +1,4 @@
-"""凭证路由：提交、冲销、查询、凭证链。"""
+"""凭证路由：提交、批量提交、冲销、查询、凭证链。"""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Response
@@ -7,6 +7,9 @@ from sqlalchemy.orm import Session
 from ..database import get_session
 from ..schemas import (
     ReversalCreate,
+    VoucherBatchCreate,
+    VoucherBatchItemOut,
+    VoucherBatchOut,
     VoucherChainOut,
     VoucherCreate,
     VoucherListOut,
@@ -28,6 +31,36 @@ def post_voucher(
     response.status_code = 201 if created else 200
     response.headers["X-Idempotent-Replay"] = "false" if created else "true"
     return voucher_out(voucher)
+
+
+@router.post(
+    "/batch",
+    response_model=VoucherBatchOut,
+    summary="批量提交凭证 (1-20 张，单事务，任一项失败整批回滚)",
+)
+def post_voucher_batch(
+    payload: VoucherBatchCreate,
+    response: Response,
+    db: Session = Depends(get_session),
+) -> VoucherBatchOut:
+    results = voucher_service.post_vouchers_batch(db, payload.items)
+    created_count = sum(1 for _, created in results if created)
+    response.status_code = 201 if created_count else 200
+    response.headers["X-Idempotent-Replay"] = "false" if created_count else "true"
+    return VoucherBatchOut(
+        count=len(results),
+        created=created_count,
+        replayed=len(results) - created_count,
+        items=[
+            VoucherBatchItemOut(
+                index=index,
+                request_id=voucher.request_id,
+                replayed=not created,
+                voucher=voucher_out(voucher),
+            )
+            for index, (voucher, created) in enumerate(results)
+        ],
+    )
 
 
 @router.get("", response_model=VoucherListOut, summary="凭证列表 (可按科目/期间过滤，游标分页)")

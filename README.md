@@ -14,6 +14,7 @@
 - **不可变凭证**：过账后凭证头/分录不可 `UPDATE`/`DELETE`（服务层 + SQLite 触发器双重保证），并分配期间内顺序凭证号 `V-YYYY-MM-NNNN`。
 - **只能反向冲销**：撤销通过提交「反向凭证」完成——借贷方向逐行对调、金额不变，双向保留 `reverses_id` / `reversed_by_id` 关联，可跨期间冲销（原期间已结账也可冲入新的开放期间），禁止重复冲销。
 - **request_id 幂等**：客户端为每次提交提供唯一键，网络重试/重复提交返回同一凭证（`200` + `X-Idempotent-Replay: true`），余额不重复累计、**支出限额不重复占用**。
+- **批量过账**：`POST /vouchers/batch` 一次按顺序提交 1–20 张普通凭证，逐项返回凭证及是否幂等回放；全部新凭证、凭证号与余额更新共用**一个事务**，任一项失败整批回滚；批内重复 `request_id` 直接拒绝，已存在的 `request_id` 按原有幂等语义回放；同批前序新凭证占用的支出限额计入后序校验。
 - **费用科目月度支出限额**：可为费用科目按 `YYYY-MM` 设置/调整支出上限；过账时在同一写事务内把本次借方费用与该科目本月已过账（未冲销）借方费用合计比较，超限整体拒绝，不写入凭证、凭证号或余额；被冲销凭证自动释放原期间已用额度。
 - **余额物化**：按（科目 × 期间）实时维护借贷累计额，过账/冲销在同一事务内 UPSERT。
 - **查询**：科目余额（可按期间）、科目分类账（逐笔累计余额、游标分页）、凭证列表（按科目/期间过滤）、凭证链（原始凭证 ↔ 反向凭证）。
@@ -72,6 +73,7 @@ python3 -m pytest -q
 | GET | `/accounts/{id}/balances?period=YYYY-MM` | 科目各期间余额 |
 | GET | `/accounts/{id}/ledger?period_from=&period_to=&cursor=&limit=` | 科目分类账（逐笔累计） |
 | POST | `/vouchers` | 提交凭证（`request_id` 幂等） |
+| POST | `/vouchers/batch` | 批量提交凭证（1–20 张，单事务，逐项返回是否幂等回放） |
 | GET | `/vouchers?account_id=&period=&cursor=` | 凭证列表/过滤 |
 | GET | `/vouchers/by-request/{request_id}` | 按幂等键反查 |
 | GET | `/vouchers/{id}` | 凭证详情 |
@@ -91,6 +93,8 @@ python3 -m pytest -q
 ```
 
 ## 快速上手示例
+
+以下示例均假设服务已通过 `docker compose up --build` 启动并监听本机 **http://localhost:8000**（`docker-compose.yml` 默认把容器 8000 端口映射到宿主机 8000；交互式文档见 http://localhost:8000/docs）。
 
 ### 1. 创建科目
 
@@ -250,6 +254,60 @@ curl -XPOST localhost:8000/vouchers -H 'Content-Type: application/json' -d '{
 - **并发不共超**：所有过账与限额调整都在事务起点以 `BEGIN IMMEDIATE` 取得保留锁、串行提交，后一个事务看到的已用额必然包含前一个已提交事务，因此两笔并发过账不可能各自"看到旧余额"而共同突破上限；
 - 限额不随期间结账冻结：结账后仍可调整限额（但期间已关闭，本就无法再向该期间入账）。
 
+### 7. 批量提交凭证
+
+`POST /vouchers/batch` 一次按请求顺序提交 1–20 张普通凭证（与 `POST /vouchers` 相同的报文结构，外层包一层 `items`），服务仍监听 localhost:8000：
+
+```bash
+curl -XPOST localhost:8000/vouchers/batch -H 'Content-Type: application/json' -d '{
+  "items": [
+    {
+      "request_id": "batch-2026-0001",
+      "date": "2026-09-22",
+      "currency": "CNY",
+      "memo": "购置实验材料一批",
+      "lines": [
+        {"account_id": 6, "direction": "debit",  "amount": "1200.00"},
+        {"account_id": 1, "direction": "credit", "amount": "1200.00"}
+      ]
+    },
+    {
+      "request_id": "batch-2026-0002",
+      "date": "2026-09-22",
+      "currency": "CNY",
+      "memo": "支付学术会议注册费",
+      "lines": [
+        {"account_id": 7, "direction": "debit",  "amount": "300.00"},
+        {"account_id": 1, "direction": "credit", "amount": "300.00"}
+      ]
+    }
+  ]
+}'
+```
+
+响应逐项给出凭证及是否幂等回放（`replayed`），顺序与请求一致：
+
+```json
+{
+  "count": 2, "created": 2, "replayed": 0,
+  "items": [
+    {"index": 0, "request_id": "batch-2026-0001", "replayed": false,
+     "voucher": {"id": 4, "number": "V-2026-09-0004", "status": "posted", "...": "..."}},
+    {"index": 1, "request_id": "batch-2026-0002", "replayed": false,
+     "voucher": {"id": 5, "number": "V-2026-09-0005", "status": "posted", "...": "..."}}
+  ]
+}
+```
+
+批量语义：
+
+- **条数限制**：一批 1–20 张，空批或超过 20 张直接 `422`；
+- **单事务**：全部新凭证、凭证号与余额更新共用一个事务，任一项校验失败（期间已结账 `409`、借贷不平衡/币种不一致 `422`、支出限额超限 `422` 等）整批回滚——不写入任何凭证、不消耗凭证号、不改动余额；
+- **批内去重**：同一批内 `request_id` 重复直接 `422`（`reason=duplicate_request_id_in_batch`），整批不写入；
+- **幂等回放**：`request_id` 已存在的条目按单笔接口同样的语义回放原凭证（`replayed: true`），不重复累计余额、不重复占用限额；全部回放时整体返回 `200` + `X-Idempotent-Replay: true`，含新建条目时返回 `201`；
+- **限额批内累计**：同批前序新凭证占用的费用科目月度限额计入后序凭证校验（如限额 1000，批内先借 600 再借 500，第二项超限、整批回滚）；
+- 校验规则（期间、借贷平衡、币种一致、支出限额）与单笔 `POST /vouchers` 完全一致，单笔接口行为不变。
+
 ## 关键设计说明
 
 ### 复式记账规则
@@ -266,7 +324,7 @@ curl -XPOST localhost:8000/vouchers -H 'Content-Type: application/json' -d '{
 
 ### 事务与并发
 
-所有写入（校验 → 编号 → 凭证/分录 → 余额 UPSERT → 冲销回填）在单个事务内完成。连接配置：
+所有写入（校验 → 编号 → 凭证/分录 → 余额 UPSERT → 冲销回填）在单个事务内完成。批量过账把整批新凭证放在同一个事务里、只在最后提交一次：前序凭证 flush 后即对后序凭证的限额已用额聚合可见，任一项失败整批回滚。连接配置：
 
 - pysqlite autocommit 模式由 SQLAlchemy 全权管理事务边界；
 - 每个事务以 `BEGIN IMMEDIATE` 开始，进入即取保留锁，写冲突在事务起点排队（`busy_timeout=10s`），而非在提交时抛锁错误；
@@ -304,9 +362,9 @@ API 边界使用字符串（正则限定非负、最多两位小数），服务�
 │   ├── errors.py            # 统一业务异常
 │   ├── serializers.py       # ORM -> 响应模型
 │   ├── seed.py              # 演示账套 (幂等)
-│   ├── routers/             # accounts (含支出限额) / periods / vouchers / reports
-│   └── services/            # master_data（科目/期间）、voucher（过账/冲销/查询）、spending_limits（限额设置/校验）、reports（只读报表）
-├── tests/test_api.py        # 25 组端到端测试
+│   ├── routers/             # accounts (含支出限额) / periods / vouchers (含批量提交) / reports
+│   └── services/            # master_data（科目/期间）、voucher（过账/批量/冲销/查询）、spending_limits（限额设置/校验）、reports（只读报表）
+├── tests/test_api.py        # 34 组端到端测试
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
